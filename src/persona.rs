@@ -8,7 +8,8 @@ use crate::settings::Settings;
 use crate::{Bm25Retriever, Character, Embedder, Error, Identification, Message, Result, Retriever};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -119,9 +120,9 @@ impl PersonaStore {
         std::fs::create_dir_all(&tmp).map_err(io(&tmp))?;
         let written = (|| -> Result<()> {
             write_json(&tmp.join("meta.json"), &meta)?;
-            write_json_compact(&tmp.join("messages.json"), messages)?;
-            let sp = tmp.join("system_prompt.txt");
-            std::fs::write(&sp, &prompt).map_err(io(&sp))?;
+            let packed = serde_json::to_vec(messages).map_err(|e| Error::Json(e.to_string()))?;
+            write_file(&tmp.join("messages.json"), &packed)?;
+            write_file(&tmp.join("system_prompt.txt"), prompt.as_bytes())?;
             std::fs::rename(&tmp, &dir).map_err(io(&dir))
         })();
         if let Err(e) = written {
@@ -141,7 +142,7 @@ impl PersonaStore {
             if e.file_name().to_string_lossy().starts_with('.') {
                 continue;
             }
-            if let Ok(m) = read_json::<PersonaMeta>(&e.path().join("meta.json")) {
+            if let Ok(m) = self.read_meta(&e.path()) {
                 out.push(m);
             }
         }
@@ -149,9 +150,18 @@ impl PersonaStore {
         Ok(out)
     }
 
+    /// A folder that was renamed or copied goes by its folder name: names must stay unique.
+    fn read_meta(&self, dir: &Path) -> Result<PersonaMeta> {
+        let mut meta: PersonaMeta = read_json(&dir.join("meta.json"))?;
+        if !self.dir(&meta.name).is_ok_and(|own| own.file_name() == dir.file_name()) {
+            meta.name = dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        }
+        Ok(meta)
+    }
+
     pub fn load_persona(&self, name: &str) -> Result<Persona> {
         let dir = self.path(name)?;
-        let meta: PersonaMeta = read_json(&dir.join("meta.json"))?;
+        let meta = self.read_meta(&dir)?;
         let messages: Vec<Message> = read_json(&dir.join("messages.json"))?;
         let sp = dir.join("system_prompt.txt");
         let prompt = std::fs::read_to_string(&sp).map_err(io(&sp))?;
@@ -186,8 +196,7 @@ impl PersonaStore {
     }
 
     pub fn save_system_prompt(&self, name: &str, prompt: &str) -> Result<()> {
-        let sp = self.path(name)?.join("system_prompt.txt");
-        std::fs::write(&sp, prompt).map_err(io(&sp))
+        write_file(&self.path(name)?.join("system_prompt.txt"), prompt.as_bytes())
     }
 
     /// Set or clear the persona's model; [`crate::resolve_model`] validates it when chatting.
@@ -206,20 +215,36 @@ impl PersonaStore {
     /// Folder of an existing persona.
     pub fn path(&self, name: &str) -> Result<PathBuf> {
         let dir = self.dir(name)?;
-        if dir.join("meta.json").exists() { Ok(dir) } else { Err(Error::NotFound(name.into())) }
+        if dir.join("meta.json").exists() {
+            return Ok(dir);
+        }
+        // a folder renamed by hand, taken literally as long as it is a plain name inside `root`
+        let mut parts = Path::new(name).components();
+        let plain = matches!((parts.next(), parts.next()), (Some(Component::Normal(_)), None)) && !name.starts_with('.');
+        let literal = self.root.join(name);
+        if plain && literal.join("meta.json").exists() { Ok(literal) } else { Err(Error::NotFound(name.into())) }
     }
 
     /// The slug has no separators or dots, so it cannot escape `root`.
     fn dir(&self, name: &str) -> Result<PathBuf> {
-        let slug: String = name
-            .trim()
-            .to_lowercase()
-            .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-            .collect();
-        if slug.trim_matches('_').is_empty() {
-            return Err(Error::Invalid(format!("bad persona name `{name}`")));
+        const MAX_SLUG: usize = 60;
+        let name = name.trim().to_lowercase();
+        if name.is_empty() {
+            return Err(Error::Invalid("a persona needs a name".into()));
         }
+        let slug: String =
+            name.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+        let hash = name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
+        let device = |stem: &str| slug.strip_prefix(stem).is_some_and(|n| n.len() == 1 && n.as_bytes()[0].is_ascii_digit());
+        let slug = if slug.trim_matches('_').is_empty() {
+            format!("u{hash:x}") // an emoji or symbols only
+        } else if slug.chars().count() > MAX_SLUG {
+            format!("{}-{hash:x}", slug.chars().take(MAX_SLUG).collect::<String>())
+        } else if matches!(slug.as_str(), "con" | "prn" | "aux" | "nul") || device("com") || device("lpt") {
+            format!("{slug}_") // reserved by Windows
+        } else {
+            slug
+        };
         Ok(self.root.join(slug))
     }
 }
@@ -230,15 +255,22 @@ fn io(p: &Path) -> impl Fn(std::io::Error) -> Error + '_ {
 
 /// Pretty-printed, for files people may edit.
 fn write_json<T: Serialize + ?Sized>(p: &Path, v: &T) -> Result<()> {
-    let s = serde_json::to_vec_pretty(v).map_err(|e| Error::Json(e.to_string()))?;
-    std::fs::write(p, s).map_err(io(p))
+    write_file(p, &serde_json::to_vec_pretty(v).map_err(|e| Error::Json(e.to_string()))?)
 }
 
-fn write_json_compact<T: Serialize + ?Sized>(p: &Path, v: &T) -> Result<()> {
-    let f = std::fs::File::create(p).map_err(io(p))?;
-    let mut w = std::io::BufWriter::new(f);
-    serde_json::to_writer(&mut w, v).map_err(|e| Error::Json(e.to_string()))?;
-    std::io::Write::flush(&mut w).map_err(io(p))
+/// Replaces the file in one step, readable only by its owner: these hold private chats and an API key.
+fn write_file(p: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = p.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(bytes))
+        .and_then(|_| std::fs::rename(&tmp, p))
+        .map_err(io(p))
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(p: &Path) -> Result<T> {

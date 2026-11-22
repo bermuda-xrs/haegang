@@ -100,17 +100,26 @@ pub(super) fn is_heading(p: &str) -> bool {
     if n == 0 || n > 60 || p.contains(OPENERS) {
         return false;
     }
-    let roman = p.chars().all(|c| "IVXLC. ".contains(c));
+    let roman = p.chars().all(|c| "IVXLC. ".contains(c)) && p.contains(char::is_alphabetic);
     if ends_sentence(p) {
         return roman;
     }
     let lower = p.to_lowercase();
     let word = ["chapter", "part ", "book ", "prologue", "epilogue", "act ", "scene "].iter().any(|w| lower.starts_with(w));
-    let markdown = p.starts_with('#');
-    let korean = p.starts_with('제') && p.ends_with(['장', '부', '화']);
+    let markdown = p.trim_start_matches('#').starts_with(' ');
     let letters: Vec<char> = p.chars().filter(|c| c.is_alphabetic()).collect();
     let capitals = letters.len() >= 2 && letters.iter().all(|c| c.is_uppercase());
-    word || markdown || korean || capitals || roman
+    word || markdown || is_korean_chapter(p) || capitals || roman
+}
+
+/// 제3장, 제 3 장 폭풍
+fn is_korean_chapter(p: &str) -> bool {
+    let Some(rest) = p.strip_prefix('제').map(str::trim_start) else { return false };
+    let unit = rest.trim_start_matches(|c: char| c.is_ascii_digit() || "일이삼사오육칠팔구십백".contains(c));
+    let mut unit_chars = unit.trim_start().chars();
+    unit.len() < rest.len()
+        && unit_chars.next().is_some_and(|c| "장부화편회막".contains(c))
+        && unit_chars.next().is_none_or(char::is_whitespace)
 }
 
 pub(super) fn chunks(text: &str, max: usize) -> Vec<String> {
@@ -132,7 +141,8 @@ pub(super) fn chunks(text: &str, max: usize) -> Vec<String> {
     let mut indices = text.char_indices().peekable();
     while let Some((i, c)) = indices.next() {
         let next = indices.peek().map(|x| x.1);
-        let boundary = next.is_none() || c == '\n' || (SENTENCE_ENDS.contains(&c) && next.is_some_and(char::is_whitespace));
+        let full_width = matches!(c, '。' | '！' | '？') && !next.is_some_and(|n| CLOSERS.contains(&n));
+        let boundary = next.is_none() || c == '\n' || full_width || (SENTENCE_ENDS.contains(&c) && next.is_some_and(char::is_whitespace));
         if !boundary {
             continue;
         }

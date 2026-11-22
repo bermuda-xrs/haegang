@@ -94,12 +94,13 @@ fn parse_line(line: &str) -> Result<Value> {
     serde_json::from_str(line).map_err(|e| Error::Backend(format!("bad stream line {line:?}: {e}")))
 }
 
-/// Drop `<think>` reasoning, including a dangling close tag.
+/// Drop `<think>` reasoning, including a dangling close tag and reasoning cut off by the token limit.
 pub(crate) fn strip_think(s: &str) -> String {
     let mut s = s;
     if let Some(i) = s.rfind("</think>") {
         s = &s[i + "</think>".len()..];
     }
+    s = s.split("<think>").next().unwrap_or(s);
     s.trim().to_string()
 }
 
@@ -287,5 +288,6 @@ mod tests {
         assert_eq!(strip_think("<think>hmm</think>\n\nhello"), "hello");
         assert_eq!(strip_think("reasoning</think> hi"), "hi");
         assert_eq!(strip_think("  plain "), "plain");
+        assert_eq!(strip_think("<think>never finished"), "");
     }
 }

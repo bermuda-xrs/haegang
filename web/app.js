@@ -23,7 +23,7 @@ const ICON = {
 const EMOJI = '😀 😂 🥹 😍 😘 😎 🤔 😅 😭 😡 🥺 😴 🙄 😏 🤗 😬 👍 👎 👏 🙏 💪 🔥 ✨ 💀 ❤️ 🖤 🤍 💔 🎉 👀 🙌 🤝 ☕ 🍕 🌙 ⭐ 🥀 🦇 🕯️ 🗡️'.split(' ');
 
 const S = {
-  personas: [], cur: null, chat: [], models: null, busy: false, filter: '', me: { avatar: null },
+  personas: [], cur: null, chat: [], models: null, live: {}, drafts: {}, filter: '', me: { avatar: null },
   infoOpen: false, infoFor: null, infoParts: [], pollTimer: null, importToken: null, importAbort: null,
 };
 
@@ -155,7 +155,7 @@ function paintRail() {
 }
 
 async function refreshList() {
-  try { S.personas = await api('GET', '/api/personas'); } catch { S.personas = []; }
+  try { S.personas = await api('GET', '/api/personas'); } catch { /* keep what is shown */ }
   renderList();
   if (S.cur && S.infoOpen) refreshInfo();
   const building = S.personas.some((p) => p.embeddings === 'building');
@@ -218,10 +218,20 @@ function renderEmpty() {
 async function openThread(name) {
   S.cur = name;
   document.body.classList.add('in-thread');
-  try { S.chat = await api('GET', pp(name) + '/chat'); } catch { S.chat = []; }
+  const chat = await api('GET', pp(name) + '/chat').catch(() => []);
+  if (S.cur !== name) return; // another thread was opened meanwhile
+  S.chat = chat;
   buildThread();
   renderList();
   if (S.infoOpen) renderInfo();
+}
+
+function closeThread() {
+  S.cur = null;
+  toggleInfo(false);
+  document.body.classList.remove('in-thread');
+  renderList();
+  renderEmpty();
 }
 
 function personaOf(name) { return S.personas.find((p) => p.name === name); }
@@ -229,11 +239,10 @@ function personaOf(name) { return S.personas.find((p) => p.name === name); }
 function buildThread() {
   const t = $('#thread');
   t.replaceChildren();
-  const p = personaOf(S.cur);
   const head = el('div', 't-head');
   const back = el('button', 'icon-btn back');
   back.innerHTML = ICON.back;
-  back.onclick = () => { document.body.classList.remove('in-thread'); S.cur = null; renderList(); renderEmpty(); };
+  back.onclick = closeThread;
   const who = el('div', 'who');
   const status = el('div', 's', isOnline() ? 'Active now' : 'Offline');
   ensureModels().then(() => { status.textContent = isOnline() ? 'Active now' : 'Offline'; });
@@ -252,6 +261,8 @@ function buildThread() {
   const ta = el('textarea');
   ta.rows = 1;
   ta.placeholder = 'Message...';
+  const name = S.cur;
+  ta.value = S.drafts[name] || '';
   const send = el('button', 'send', 'Send');
   send.hidden = true;
   const heart = el('button', 'heart');
@@ -280,19 +291,26 @@ function buildThread() {
   function sync() {
     ta.style.height = 'auto';
     ta.style.height = Math.min(ta.scrollHeight, 140) + 'px';
+    S.drafts[name] = ta.value;
     const has = ta.value.trim().length > 0;
     send.hidden = !has;
     heart.hidden = has;
   }
-  const go = (text) => { ta.value = ''; sync(); sendMessage(text); };
+  const go = (text) => {
+    if (name in S.live) return; // one reply at a time; the text stays in the box
+    ta.value = '';
+    sync();
+    sendMessage(text);
+  };
   ta.oninput = sync;
   ta.onkeydown = (e) => {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); if (ta.value.trim()) go(ta.value); }
   };
   send.onclick = () => go(ta.value);
-  heart.onclick = () => go('❤️');
+  heart.onclick = () => sendMessage('❤️');
 
   t.append(head, msgs, comp);
+  sync();
   renderMessages();
   ta.focus();
 }
@@ -330,6 +348,22 @@ function renderMessages() {
     // under the newest message you sent: "Seen" once they replied, otherwise "Sent"
     if (i === lastOut) box.append(el('div', 'status', i < items.length - 1 ? 'Seen' : 'Sent'));
   });
+  if (S.cur in S.live) showLive();
+  box.scrollTop = box.scrollHeight;
+}
+
+/** The reply being written: typing dots, then its text so far. */
+function showLive() {
+  const box = $('#msgs');
+  const text = S.live[S.cur];
+  const old = $('.live', box);
+  if (old && text && !old.classList.contains('typing')) {
+    $('.bubble', old).textContent = text;
+  } else {
+    const row = text ? messageRow({ role: 'persona', text, ts: Date.now() }, false, false) : typingRow();
+    row.classList.add('live');
+    if (old) old.replaceWith(row); else box.append(row);
+  }
   box.scrollTop = box.scrollHeight;
 }
 
@@ -359,48 +393,45 @@ function typingRow() {
 
 async function sendMessage(text) {
   text = text.trim();
-  if (!text || S.busy || !S.cur) return;
-  const name = S.cur;
-  S.busy = true;
-  S.chat.push({ role: 'user', text, ts: Date.now() });
+  const name = S.cur, chat = S.chat;
+  if (!text || !name || name in S.live) return;
+  S.live[name] = '';
+  chat.push({ role: 'user', text, ts: Date.now() });
   renderMessages();
-  const box = $('#msgs');
-  const live = typingRow();
-  box.append(live);
-  box.scrollTop = box.scrollHeight;
-  const fail = (msg) => {
-    live.remove();
-    box.append(el('div', 'note', 'Could not get a reply: ' + msg));
-    box.scrollTop = box.scrollHeight;
-  };
+  let error = null;
   try {
     const res = await fetch(pp(name) + '/chat', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }),
     });
-    if (!res.ok) {
-      const j = await res.json().catch(() => ({}));
-      throw new Error(j.error || res.statusText);
-    }
-    let acc = '', bubble = null, done = false, error = null;
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || res.statusText);
+    let reply = null, failed = null;
     await readLines(res, (j) => {
-      if (j.error) error = j.error;
-      else if (j.done) { S.chat.push({ role: 'persona', text: j.text, ts: j.ts }); done = true; }
+      if (j.error) failed = j.error;
+      else if (j.done) reply = j;
       else if (j.t) {
-        acc += j.t;
-        if (!bubble) { bubble = messageRow({ role: 'persona', text: '', ts: Date.now() }, false, false); live.replaceWith(bubble); }
-        $('.bubble', bubble).textContent = acc;
-        if (S.cur === name) box.scrollTop = box.scrollHeight;
+        S.live[name] += j.t;
+        if (S.cur === name) showLive();
       }
     });
-    if (error) throw new Error(error);
-    if (!done) throw new Error('connection closed early');
-    if (S.cur === name) renderMessages();
+    if (failed || !reply) throw new Error(failed || 'connection closed early');
+    if (S.chat === chat) chat.push({ role: 'persona', text: reply.text, ts: reply.ts });
+    else if (S.cur === name) { // left and came back, or cleared
+      const stored = await api('GET', pp(name) + '/chat');
+      if (S.cur === name) S.chat = stored;
+    }
   } catch (e) {
-    if (S.cur === name) fail(e.message);
-  } finally {
-    S.busy = false;
-    refreshList();
+    error = e.message;
   }
+  delete S.live[name];
+  if (S.cur === name && $('#msgs')) {
+    renderMessages();
+    if (error) {
+      const box = $('#msgs');
+      box.append(el('div', 'note', 'Could not get a reply: ' + error));
+      box.scrollTop = box.scrollHeight;
+    }
+  }
+  refreshList();
 }
 
 function toggleInfo(force) {
@@ -410,7 +441,7 @@ function toggleInfo(force) {
 }
 
 async function ensureModels() {
-  if (!S.models) { try { S.models = await api('GET', '/api/models'); } catch { S.models = { online: false, models: [], default: '' }; } }
+  if (!S.models?.online) { try { S.models = await api('GET', '/api/models'); } catch { S.models = { online: false, models: [], default: '' }; } }
   return S.models;
 }
 
@@ -426,7 +457,7 @@ async function renderInfo() {
   S.infoParts = [
     { make: infoCard, key: (p) => [p.avatar] },
     { make: infoModel, key: (p) => [p.model, S.models] },
-    { make: infoMemory, key: (p) => [p.embeddings] },
+    { make: infoMemory, key: (p) => [p.embeddings, p.index_error] },
   ].map((part) => ({ ...part, node: part.make(p), shown: JSON.stringify(part.key(p)) }));
   box.replaceChildren(el('div', 'i-head', 'Details'), ...S.infoParts.map((part) => part.node), infoPrompt(p), infoDanger(p));
 }
@@ -477,7 +508,6 @@ function infoModel(p) {
   sel.onchange = async () => {
     await api('PUT', pp(p.name) + '/model', { model: sel.value || null }).catch((e) => alert(e.message));
     await refreshList();
-    buildThread();
   };
   sec.append(el('h3', null, 'Model'), sel);
   if (!models.online) sec.append(el('div', 'hint', 'Model server is offline: ' + (models.error || '')));
@@ -492,6 +522,7 @@ function infoMemory(p) {
     const b = el('button', 'btn ghost', 'Build semantic index');
     b.onclick = async () => { await api('POST', pp(p.name) + '/embeddings').catch((e) => alert(e.message)); refreshList(); };
     sec.append(b);
+    if (p.index_error) sec.append(el('div', 'err', 'The last build failed: ' + p.index_error));
   }
   return sec;
 }
@@ -522,20 +553,17 @@ function infoDanger(p) {
   const clear = el('button', 'btn ghost', 'Clear chat');
   clear.onclick = async () => {
     if (!confirm('Clear this conversation?')) return;
-    await api('DELETE', pp(p.name) + '/chat');
-    S.chat = [];
-    renderMessages();
+    try { await api('DELETE', pp(p.name) + '/chat'); } catch (e) { alert(e.message); return; }
+    if (S.cur === p.name) { S.chat = []; renderMessages(); }
     refreshList();
   };
   const del = el('button', 'btn danger', 'Delete persona');
   del.onclick = async () => {
     if (!confirm(`Delete “${p.name}” and all its data?`)) return;
-    await api('DELETE', pp(p.name));
-    S.cur = null;
-    toggleInfo(false);
-    document.body.classList.remove('in-thread');
-    await refreshList();
-    renderEmpty();
+    try { await api('DELETE', pp(p.name)); } catch (e) { alert(e.message); return; }
+    delete S.drafts[p.name];
+    closeThread();
+    refreshList();
   };
   acts.append(clear, del);
   sd.append(acts);
@@ -565,8 +593,27 @@ function openImport() {
   dir.onchange = () => start(dir.files);
   drop.ondragover = (e) => { e.preventDefault(); drop.classList.add('over'); };
   drop.ondragleave = () => drop.classList.remove('over');
-  drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove('over'); start(e.dataTransfer.files); };
+  drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove('over'); droppedFiles(e.dataTransfer).then(start); };
   $('#dlg-import').showModal();
+}
+
+/** Dropped files, including those inside dropped folders. */
+async function droppedFiles(data) {
+  const entries = Array.from(data.items).map((i) => i.webkitGetAsEntry?.()).filter(Boolean);
+  if (!entries.length) return Array.from(data.files);
+  const out = [];
+  const walk = async (entry) => {
+    if (entry.name.startsWith('.')) return;
+    if (entry.isFile) { out.push(await new Promise((ok, no) => entry.file(ok, no))); return; }
+    const reader = entry.createReader();
+    for (;;) { // a reader hands out a folder in batches
+      const batch = await new Promise((ok, no) => reader.readEntries(ok, no));
+      if (!batch.length) return;
+      for (const e of batch) await walk(e);
+    }
+  };
+  for (const e of entries) await walk(e);
+  return out;
 }
 
 function progressView() {
@@ -583,19 +630,22 @@ async function runImport(list, body, status) {
   if (!picked.length) { status.append(el('div', 'err', 'No files in that selection.')); return; }
   const view = progressView();
   view.label.textContent = `Uploading ${picked.length} file(s)…`;
-  status.append(view.label, view.bar);
+  body.replaceChildren(view.label, view.bar);
+  let token = null;
+  const ended = () => S.importToken !== token; // the dialog was closed, and maybe another import started
   try {
-    const { token } = await api('POST', '/api/import/start', {});
+    ({ token } = await api('POST', '/api/import/start', {}));
     S.importToken = token;
     for (let i = 0; i < picked.length; i++) {
+      if (ended()) return;
       const query = `token=${token}&name=${encodeURIComponent(picked[i].name)}`;
       const r = await fetch('/api/import/file?' + query, { method: 'POST', body: picked[i] });
       if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
       view.fill.style.width = ((i + 1) / picked.length) * 100 + '%';
     }
-    await identify(body, token);
+    if (!ended()) chooseCharacters(body, token, await runIdentify(body, token));
   } catch (e) {
-    if (e.name === 'AbortError') return;
+    if (e.name === 'AbortError' || ended()) return;
     cancelImport();
     body.replaceChildren(el('div', 'err', e.message));
   }
@@ -628,10 +678,6 @@ async function runIdentify(body, token, correction) {
   });
   if (error || !result) throw new Error(error || 'connection closed early');
   return result;
-}
-
-async function identify(body, token) {
-  chooseCharacters(body, token, await runIdentify(body, token));
 }
 
 function characterOption(c, checked, onChange) {
@@ -688,7 +734,7 @@ function chooseCharacters(body, token, info, error) {
   const go = el('button', 'btn');
   go.onclick = () => (wrong.checked
     ? correctIdentification(body, token, info, why.value.trim())
-    : createPersonas(token, options.filter((o) => o.box.checked).map((o) => o.name), err, go));
+    : createPersonas(token, options.filter((o) => o.box.checked), err, go));
   body.append(wrongRow, why, err, go);
   update();
 }
@@ -701,15 +747,17 @@ async function correctIdentification(body, token, info, correction) {
   }
 }
 
-async function createPersonas(token, characters, err, go) {
+async function createPersonas(token, chosen, err, go) {
   go.disabled = true;
   try {
-    const r = await api('POST', '/api/import/create', { token, characters });
+    const r = await api('POST', '/api/import/create', { token, characters: chosen.map((o) => o.name) });
     await refreshList();
     if (r.failed.length) {
       err.textContent = r.failed.map((f) => `${f.name}: ${f.error}`).join('; ');
       err.hidden = false;
       go.disabled = false;
+      // trying again must not create the others twice
+      for (const o of chosen) o.box.checked = r.failed.some((f) => f.name === o.name);
       return;
     }
     S.importToken = null; // consumed by the server
@@ -772,10 +820,11 @@ async function openSettings() {
   const err = el('div', 'err'); err.hidden = true;
   const save = el('button', 'btn', 'Save');
   save.onclick = async () => {
+    const temperature = parseFloat(temp.value); // 0 is a valid choice
     const next = {
       ...s, backend: backend.value, base_url: url.value.trim(), model: model.value,
       embed_model: emb.value.trim() || null,
-      gen: { ...s.gen, temperature: parseFloat(temp.value) || 0.8, max_tokens: parseInt(maxt.value, 10) || 256 },
+      gen: { ...s.gen, temperature: Number.isFinite(temperature) ? temperature : 0.8, max_tokens: parseInt(maxt.value, 10) || 256 },
     };
     try {
       await api('PUT', '/api/settings', next);
@@ -801,7 +850,7 @@ $('#btn-import-rail').onclick = openImport;
 $('#btn-new').onclick = openImport;
 $('#btn-settings').onclick = openSettings;
 $('#btn-me').onclick = changeMyPhoto;
-$('#btn-messages').onclick = () => { S.cur = null; document.body.classList.remove('in-thread'); renderList(); renderEmpty(); };
+$('#btn-messages').onclick = closeThread;
 $('#search').oninput = (e) => { S.filter = e.target.value; renderList(); };
 
 renderEmpty();

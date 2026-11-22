@@ -6,6 +6,7 @@
 use crate::retrieval::{top_k, Bm25Retriever, Exchange, Exemplar, Query, Retriever};
 use crate::{Embedder, Error, Result};
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -104,6 +105,20 @@ impl DenseIndex {
         std::fs::write(path, b).map_err(|e| Error::Io(format!("{}: {e}", path.display())))
     }
 
+    /// The embedding model a saved index was built with, without loading it.
+    pub fn model_of(path: &Path) -> Option<String> {
+        let mut head = [0u8; HEADER_BYTES];
+        let mut f = std::fs::File::open(path).ok()?;
+        f.read_exact(&mut head).ok()?;
+        let model_len = u32::from_le_bytes(head[16..20].try_into().unwrap());
+        if &head[..4] != MAGIC || model_len > 1024 {
+            return None;
+        }
+        let mut model = vec![0u8; model_len as usize];
+        f.read_exact(&mut model).ok()?;
+        String::from_utf8(model).ok()
+    }
+
     /// `None` if the file is missing or malformed; the caller then rebuilds.
     pub fn load(path: &Path) -> Option<Self> {
         let b = std::fs::read(path).ok()?;
@@ -174,10 +189,11 @@ mod tests {
         idx.save(&p).unwrap();
         let loaded = DenseIndex::load(&p).unwrap();
         assert_eq!((loaded.len(), loaded.model.as_str()), (2, "m"));
+        assert_eq!(DenseIndex::model_of(&p).as_deref(), Some("m"));
         assert_eq!(loaded.search(&[0.1, 0.9], 1)[0].0, 1);
         assert!(loaded.search(&[0.1, 0.9, 0.3], 1).is_empty()); // wrong dimension
         std::fs::write(&p, b"junk").unwrap();
-        assert!(DenseIndex::load(&p).is_none());
+        assert!(DenseIndex::load(&p).is_none() && DenseIndex::model_of(&p).is_none());
         let _ = std::fs::remove_file(p);
     }
 }

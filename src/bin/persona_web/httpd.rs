@@ -90,8 +90,11 @@ pub fn read_request(stream: &TcpStream) -> io::Result<Option<Request>> {
     if len > MAX_BODY {
         return Err(bad("body too large"));
     }
-    let mut body = vec![0u8; len];
-    r.read_exact(&mut body)?;
+    let mut body = Vec::new();
+    r.take(len as u64).read_to_end(&mut body)?;
+    if body.len() < len {
+        return Err(bad("request body ended early"));
+    }
     Ok(Some(Request { method, path, query, host, origin, body }))
 }
 

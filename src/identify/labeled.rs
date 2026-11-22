@@ -1,6 +1,7 @@
 //! Text that labels its speakers: chat logs (WhatsApp, KakaoTalk, IRC, `Name: text`), plays
 //! (`HAMLET. Who's there?`) and screenplays (an all-caps cue above the dialogue).
 
+use super::cast::is_title;
 use std::collections::HashMap;
 
 /// `speaker == None` is narration: stage directions and action lines.
@@ -11,17 +12,31 @@ pub(super) struct Turn {
 
 const NOT_SPEAKERS: &[&str] = &[
     "note", "warning", "tip", "example", "step", "chapter", "part", "figure", "table", "summary", "abstract",
-    "keywords", "see", "source", "http", "https", "date", "time", "from", "to", "subject", "re", "fwd",
+    "keywords", "see", "source", "http", "https", "date", "time", "from", "to", "subject", "re", "fwd", "section",
+    "question", "day", "act", "scene", "verse",
 ];
+/// Direction marks WhatsApp puts around names and lines.
+const INVISIBLE: &[char] = &['\u{200e}', '\u{200f}', '\u{202a}', '\u{202c}', '\u{feff}'];
+
+/// "Dr." or an initial, where a full stop is part of the name.
+fn is_abbreviation(word: &str) -> bool {
+    word.ends_with('.') && (is_title(word) || word.split('.').all(|part| part.chars().count() <= 1))
+}
 
 fn plausible_name(name: &str) -> bool {
     let words = name.split_whitespace().count();
+    let unnumbered = name.trim_end_matches(|c: char| c.is_ascii_digit()).trim_end().to_lowercase();
     (1..=4).contains(&words)
         && name.chars().count() <= 40
         && name.chars().next().is_some_and(char::is_alphabetic)
-        && !name.chars().last().is_some_and(|c| c.is_ascii_digit())
-        && !name.contains(['.', ',', ';', '!', '?', '"', '“', '”', '=', '/'])
-        && !NOT_SPEAKERS.contains(&name.to_lowercase().as_str())
+        && !name.contains([',', ';', '!', '?', '"', '“', '”', '=', '/'])
+        && name.split_whitespace().filter(|w| w.contains('.')).all(is_abbreviation)
+        && !NOT_SPEAKERS.contains(&unnumbered.as_str())
+}
+
+/// Beside a timestamp anything short can be a name: phone numbers, nicknames with symbols.
+fn stamped_name(name: &str) -> bool {
+    (1..=40).contains(&name.chars().count()) && (name.starts_with('+') || name.contains(char::is_alphabetic))
 }
 
 /// Drop a leading timestamp such as `[10:23]` or `12/31/20, 10:23 PM -`.
@@ -53,19 +68,22 @@ fn strip_time(line: &str) -> &str {
 }
 
 fn label(line: &str) -> Option<(String, String)> {
+    let line = line.trim_start_matches(INVISIBLE);
     // KakaoTalk: [name] [time] text
     if let Some(inner) = line.strip_prefix('[') {
         if let Some((name, rest)) = inner.split_once(']') {
             if let Some(after) = rest.trim_start().strip_prefix('[') {
                 if let Some((stamp, text)) = after.split_once(']') {
-                    if stamp.contains(|c: char| c.is_ascii_digit()) && plausible_name(name) {
+                    if stamp.contains(':') && stamp.contains(|c: char| c.is_ascii_digit()) && stamped_name(name) {
                         return Some((name.trim().to_string(), text.trim_start().to_string()));
                     }
                 }
             }
         }
     }
-    let line = strip_time(line);
+    let unstamped = strip_time(line);
+    let stamped = unstamped.len() < line.len();
+    let line = unstamped.trim_start_matches(INVISIBLE);
     // IRC: <name> text
     if let Some(inner) = line.strip_prefix('<') {
         if let Some((name, text)) = inner.split_once('>') {
@@ -80,14 +98,17 @@ fn label(line: &str) -> Option<(String, String)> {
     // name: text
     let colon = line.find([':', '：'])?;
     let name = line[..colon].trim();
-    let name = name.split(" (").next().unwrap_or(name).trim();
+    let name = name.split(" (").next().unwrap_or(name).trim().trim_matches(INVISIBLE);
     let rest = line[colon..].trim_start_matches([':', '：']).trim_start();
-    (plausible_name(name) && !rest.starts_with("//")).then(|| (name.to_string(), rest.to_string()))
+    let is_name = plausible_name(name) || (stamped && stamped_name(name));
+    (is_name && !rest.starts_with("//")).then(|| (name.to_string(), rest.to_string()))
 }
 
 /// A play's `NAME. text`; the capitals keep ordinary sentences out.
 fn play_label(line: &str) -> Option<(String, String)> {
-    let (name, rest) = line.split_once(". ")?;
+    let abbreviated = |i: usize| matches!(line[..i].rsplit(' ').next(), Some("MR" | "MRS" | "MS" | "DR" | "ST"));
+    let end = line.match_indices(". ").map(|m| m.0).find(|&i| !abbreviated(i))?;
+    let (name, rest) = (&line[..end], &line[end + 2..]);
     let letters: Vec<char> = name.chars().filter(|c| c.is_alphabetic()).collect();
     let capitals = letters.len() >= 2 && letters.iter().all(|c| c.is_uppercase());
     (capitals && plausible_name(name)).then(|| (name.to_string(), rest.trim_start().to_string()))
@@ -104,14 +125,13 @@ fn cue(line: &str) -> Option<String> {
 
 fn display_name(name: &str) -> String {
     if !name.chars().any(char::is_lowercase) && name.chars().any(char::is_uppercase) {
-        return name
-            .split_whitespace()
-            .map(|w| {
-                let mut cs = w.chars();
-                cs.next().map_or(String::new(), |f| f.to_string() + &cs.as_str().to_lowercase())
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
+        let mut inside_word = false;
+        let mut out = String::with_capacity(name.len());
+        for c in name.chars() {
+            if inside_word { out.extend(c.to_lowercase()) } else { out.push(c) }
+            inside_word = c.is_alphabetic();
+        }
+        return out;
     }
     name.to_string()
 }

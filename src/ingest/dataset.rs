@@ -24,7 +24,10 @@ const SENDER_KEYS: &[&str] = &["sender_name", "sender", "author", "speaker", "ch
 const PROMPT_KEYS: &[&str] = &["instruction", "prompt", "question", "query", "input"];
 const ANSWER_KEYS: &[&str] = &["output", "response", "answer", "completion", "reply"];
 /// Arrays under these keys hold the messages of one conversation.
-const CONVERSATION_KEYS: &[&str] = &["messages", "conversation", "dialog", "dialogue", "turns", "history", "chat"];
+const CONVERSATION_KEYS: &[&str] = &[
+    "messages", "conversation", "conversations", "chat_messages", "dialog", "dialogue", "turns", "history", "chat",
+];
+const TIME_KEYS: &[&str] = &["timestamp", "create_time", "created_at", "date_unixtime"];
 
 /// A parsed file with its name and format.
 pub(crate) type ParsedFile = (String, &'static str, Parsed);
@@ -169,6 +172,8 @@ impl Clock {
 enum Record {
     Msg { sender: String, explicit: bool, text: String, ts: Option<i64> },
     Pair { prompt: String, answer: String },
+    /// System prompts and tool output: no one's words.
+    NotSpeech,
 }
 
 /// One parsed file.
@@ -181,6 +186,7 @@ pub(crate) struct Parsed {
     /// Some message carried real sender info: an export, a sender field or a role.
     pub saw_sender: bool,
     real_timestamps: bool,
+    last_time: Option<i64>,
     clock: Clock,
 }
 
@@ -192,9 +198,13 @@ pub(crate) fn parse_json(bytes: &[u8], opts: &ParseOptions) -> Result<Parsed> {
             return Ok(parsed);
         }
     }
-    for v in serde_json::Deserializer::from_slice(bytes).into_iter::<Value>() {
-        let v = v.map_err(|e| Error::Json(e.to_string()))?;
-        parsed.walk(&v, 0, opts)?;
+    let values: Vec<Value> = serde_json::Deserializer::from_slice(bytes)
+        .into_iter()
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| Error::Json(e.to_string()))?;
+    match &values[..] {
+        [one] => parsed.walk(one, 0, opts)?,
+        lines => parsed.walk_array(lines, false, 0, opts)?,
     }
     if parsed.messages.is_empty() {
         return Err(Error::Invalid(
@@ -281,8 +291,10 @@ impl Parsed {
         Ok(())
     }
 
-    /// `one_conversation`: every element belongs to one group; otherwise each is its own.
+    /// `one_conversation`: every element belongs to one group; otherwise each is its own, unless they
+    /// read as people talking to each other.
     fn walk_array(&mut self, items: &[Value], one_conversation: bool, depth: usize, opts: &ParseOptions) -> Result<()> {
+        let one_conversation = one_conversation || is_conversation(items);
         if one_conversation {
             self.clock.new_group();
         }
@@ -315,6 +327,7 @@ impl Parsed {
                 self.add_text("User", true, &prompt, None, opts);
                 self.add_text("Assistant", true, &answer, None, opts);
             }
+            Record::NotSpeech => self.skipped += 1,
         }
     }
 
@@ -326,7 +339,8 @@ impl Parsed {
         };
         self.real_timestamps |= ts.is_some();
         self.saw_sender |= explicit;
-        let timestamp_ms = ts.unwrap_or_else(|| self.clock.tick());
+        self.last_time = ts.or(self.last_time); // a record without a time stays beside the one before it
+        let timestamp_ms = self.last_time.unwrap_or_else(|| self.clock.tick());
         self.messages.push(Message { sender: sender.to_string(), timestamp_ms, text });
     }
 }
@@ -335,16 +349,65 @@ fn pick<'a>(o: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a Value> {
     keys.iter().find_map(|k| o.iter().find(|(n, v)| n.eq_ignore_ascii_case(k) && !v.is_null()).map(|(_, v)| v))
 }
 
-/// A string, or an array of strings joined by newlines.
+/// A string, an array of strings or typed parts (`{"type": "text", "text": ..}`), or an object holding such `parts`.
 fn text_of(v: &Value) -> Option<String> {
     match v {
         Value::String(s) => Some(s.clone()),
         Value::Array(a) => {
-            let parts: Vec<&str> = a.iter().filter_map(Value::as_str).collect();
-            (!parts.is_empty()).then(|| parts.join("\n"))
+            let typed = |p: &Value| p.get("type").is_some_and(Value::is_string);
+            let parts: Vec<&str> = a
+                .iter()
+                .filter_map(|p| p.as_str().or_else(|| p.get("text").filter(|_| typed(p)).and_then(Value::as_str)))
+                .collect();
+            // plain and typed parts together are one line cut up by its formatting
+            let one_line = a.iter().any(Value::is_string) && a.iter().any(Value::is_object);
+            (!parts.is_empty()).then(|| parts.join(if one_line { "" } else { "\n" }))
         }
+        Value::Object(o) => o.get("parts").and_then(text_of),
         _ => None,
     }
+}
+
+/// A sender given as a string or as an object describing them.
+fn name_of(v: &Value) -> Option<&str> {
+    let text = |v: &Value| v.as_str().is_some_and(|s| !s.trim().is_empty());
+    match v {
+        Value::Object(o) => {
+            let role = o.get("role").and_then(Value::as_str).filter(|r| is_non_speaker(r));
+            role.or_else(|| {
+                ["name", "display_name", "username", "first_name", "role"]
+                    .iter()
+                    .find_map(|k| o.get(*k).filter(|v| text(v)).and_then(Value::as_str))
+            })
+        }
+        _ => v.as_str(),
+    }
+    .map(str::trim)
+    .filter(|s| !s.is_empty())
+}
+
+/// Milliseconds, from a number (or a string holding one) in seconds or milliseconds.
+fn time_of(o: &Map<String, Value>) -> Option<i64> {
+    let number = |v: &Value| v.as_f64().or_else(|| v.as_str()?.trim().parse().ok());
+    pick(o, &["timestamp_ms"]).and_then(Value::as_i64).or_else(|| {
+        let t = TIME_KEYS.iter().find_map(|k| pick(o, &[k]).and_then(number)).filter(|t| *t >= 1e8)?;
+        Some(if t < 1e11 { (t * 1000.0) as i64 } else { t as i64 })
+    })
+}
+
+/// Do a few people keep coming back in these records?
+fn is_conversation(items: &[Value]) -> bool {
+    const LOOK_AT: usize = 50;
+    let senders: Vec<String> = items
+        .iter()
+        .take(LOOK_AT)
+        .filter_map(|v| match record(v.as_object()?)? {
+            Record::Msg { sender, explicit: true, .. } => Some(sender),
+            _ => None,
+        })
+        .collect();
+    let distinct = senders.iter().collect::<std::collections::HashSet<_>>().len();
+    distinct >= 2 && (distinct <= 4 || distinct * 2 <= senders.len())
 }
 
 /// Chat roles used by common dataset formats -> display sender.
@@ -373,14 +436,11 @@ fn record(o: &Map<String, Value>) -> Option<Record> {
         }
     }
     let text = pick(o, TEXT_KEYS).and_then(text_of)?;
-    let ts = pick(o, &["timestamp_ms"]).and_then(Value::as_i64).or_else(|| {
-        // seconds or milliseconds
-        pick(o, &["timestamp"]).and_then(Value::as_f64).map(|t| if t < 1e11 { (t * 1000.0) as i64 } else { t as i64 })
-    });
-    let named = pick(o, SENDER_KEYS).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    let ts = time_of(o);
+    let named = SENDER_KEYS.iter().find_map(|k| pick(o, &[k]).and_then(name_of));
     let role = pick(o, &["role"]).and_then(Value::as_str);
     let (sender, explicit) = match named.or(role) {
-        Some(s) if is_non_speaker(s) => return None,
+        Some(s) if is_non_speaker(s) => return Some(Record::NotSpeech),
         Some(s) => match role_sender(s) {
             Some(mapped) => (mapped.to_string(), true),
             None if named.is_some() => (fix_mojibake(s), true),

@@ -87,11 +87,13 @@ pub fn identify(
     let mut sources: Vec<Source> = corpus.documents.iter().map(|d| Source::read(&d.content)).collect();
     let labelled_only = sources.iter().all(|s| !matches!(s, Source::Prose(_)));
     let source_name = corpus.documents.first().map_or(String::new(), |d| file_stem(&d.name));
+    let one_source = corpus.documents.iter().all(|d| file_stem(&d.name) == source_name);
+    let title = if one_source && !labelled_only { source_name.as_str() } else { "" };
     let mut notes = Vec::new();
 
     let members = match opts.correction {
         Some(correction) => corrected_members(opts, correction, progress)?,
-        None => found_members(opts, &source_name, &sources, &mut notes, progress)?,
+        None => found_members(opts, title, &sources, &mut notes, progress)?,
     };
 
     let cast = Cast::new(cast::merge(members));
@@ -104,7 +106,7 @@ pub fn identify(
     for source in &sources {
         built.add(source, &cast);
     }
-    Ok(built.finish(cast, &source_name, labelled_only, notes))
+    Ok(built.finish(cast, &source_name, title, notes))
 }
 
 /// The previous list with the user's correction applied.
@@ -232,11 +234,12 @@ fn excerpts(sources: &[Source], count: usize, chars: usize) -> Vec<String> {
 }
 
 fn names_in_sources(sources: &[Source]) -> Vec<Member> {
-    let mut names: Vec<String> = Vec::new();
+    let mut labels: HashSet<String> = HashSet::new();
+    let mut names: HashSet<String> = HashSet::new();
     for s in sources {
         match s {
-            Source::Speakers(conv) => names.extend(conv.participants.iter().cloned()),
-            Source::Labeled(turns) => names.extend(turns.iter().filter_map(|t| t.speaker.clone())),
+            Source::Speakers(conv) => labels.extend(conv.participants.iter().cloned()),
+            Source::Labeled(turns) => labels.extend(turns.iter().filter_map(|t| t.speaker.clone())),
             Source::Prose(paras) => {
                 // in a long text a lone tag could be a misreading; in a short one it is all there is
                 let once_is_enough = prose::quote_count(paras) < 40;
@@ -245,9 +248,9 @@ fn names_in_sources(sources: &[Source]) -> Vec<Member> {
             }
         }
     }
-    let mut unique: Vec<String> = names.into_iter().collect::<HashSet<_>>().into_iter().collect();
+    let mut unique: Vec<String> = labels.union(&names).cloned().collect();
     unique.sort();
-    unique.into_iter().map(|name| Member { name, ..Default::default() }).collect()
+    unique.into_iter().map(|name| Member { distinct: labels.contains(&name), name, ..Default::default() }).collect()
 }
 
 fn previous_members(previous: Option<&Identification>) -> Vec<Member> {
@@ -255,16 +258,42 @@ fn previous_members(previous: Option<&Identification>) -> Vec<Member> {
     p.characters
         .iter()
         .filter(|c| !c.voice)
-        .map(|c| Member { name: c.name.clone(), aliases: c.aliases.clone(), description: c.description.clone() })
-        .chain(p.mentioned.iter().map(|n| Member { name: n.clone(), ..Default::default() }))
+        .map(|c| Member {
+            name: c.name.clone(),
+            aliases: c.aliases.clone(),
+            description: c.description.clone(),
+            distinct: true,
+        })
+        .chain(p.mentioned.iter().map(|n| Member { name: n.clone(), distinct: true, ..Default::default() }))
         .collect()
 }
 
-/// Models invent names; keep only those that really occur in the text.
+/// Models invent names, and take bits of dialogue for names. Keep those that occur in the text: in the
+/// narration, or at least looking like a name when only spoken. A narrated alias beats a spoken name.
 fn occurring_in_text(mut found: Vec<Member>, sources: &[Source]) -> Vec<Member> {
-    let text: String = sources.iter().flat_map(Source::passages).map(|p| p.0.to_lowercase() + "\n").collect();
-    let occurs = |name: &str| text.contains(&name.to_lowercase());
-    found.iter_mut().for_each(|m| m.aliases.retain(|a| occurs(a)));
+    let (mut all, mut narration) = (String::new(), String::new());
+    for source in sources {
+        for (passage, _) in source.passages() {
+            all.push_str(&(passage.to_lowercase() + "\n"));
+        }
+        if let Source::Prose(paras) = source {
+            for piece in paras.iter().flat_map(|p| &p.pieces).filter(|p| !p.quote) {
+                narration.push_str(&(piece.text.to_lowercase() + "\n"));
+            }
+        }
+    }
+    let narrated = |name: &str| narration.contains(&name.to_lowercase());
+    let occurs = |name: &str| {
+        let name_like = !name.split_whitespace().any(|w| w.starts_with(char::is_lowercase))
+            && !name.contains(|c: char| c.is_ascii_digit());
+        narrated(name) || (name_like && all.contains(&name.to_lowercase()))
+    };
+    for m in &mut found {
+        if let Some(better) = m.aliases.iter().position(|a| narrated(a)).filter(|_| !narrated(&m.name)) {
+            std::mem::swap(&mut m.name, &mut m.aliases[better]);
+        }
+        m.aliases.retain(|a| occurs(a));
+    }
     found.retain(|m| occurs(&m.name) && !m.name.eq_ignore_ascii_case(NARRATOR));
     found
 }
@@ -396,10 +425,10 @@ impl Builder {
         }
     }
 
-    fn finish(self, cast: Cast, source_name: &str, labelled_only: bool, notes: Vec<String>) -> Identification {
+    fn finish(mut self, cast: Cast, source_name: &str, title: &str, notes: Vec<String>) -> Identification {
         let mut characters = Vec::new();
         let mut mentioned = Vec::new();
-        for (member, tally) in cast.members.into_iter().zip(self.tallies) {
+        for (member, tally) in cast.members.into_iter().zip(std::mem::take(&mut self.tallies)) {
             if tally.lines == 0 {
                 mentioned.push(member.name);
                 continue;
@@ -419,7 +448,14 @@ impl Builder {
 
         // the text's own voice: an option beside the characters, or the only one
         let alone = characters.is_empty();
-        if alone || self.narrator.lines >= MIN_NARRATION_LINES {
+        if alone {
+            for m in self.messages.iter_mut().filter(|m| m.sender != NARRATOR) {
+                m.sender = NARRATOR.to_string();
+                self.narrator.add(&m.text, false);
+            }
+        }
+        let cast_as_character = characters.iter().any(|c| c.name.eq_ignore_ascii_case(NARRATOR));
+        if alone || (self.narrator.lines >= MIN_NARRATION_LINES && !cast_as_character) {
             let (name, description) = match alone {
                 true => (source_name.to_string(), "The text as a whole"),
                 false => (NARRATOR.to_string(), "The narrative voice of the text"),
@@ -440,7 +476,7 @@ impl Builder {
         participants.sort();
         participants.dedup();
         Identification {
-            title: if labelled_only { String::new() } else { source_name.to_string() },
+            title: title.to_string(),
             characters,
             mentioned,
             unattributed: self.unattributed,
@@ -556,6 +592,16 @@ mod tests {
         assert_eq!(e.description, "the heroine");
         assert!(!e.aliases.contains(&"Betsy".to_string()));
         assert!(!names(&id).contains(&"Zorro"));
+    }
+
+    #[test]
+    fn a_line_of_dialogue_is_not_a_name() {
+        let text = "“Hello,” said Tobias.\n\n“Two cans,” said Marta.\n\n“Good,” said Tobias.\n";
+        let m = model(&[r#"{"characters":[{"name":"Two cans","aliases":["Marta"],"role":"x"}]}"#]);
+        let opts = IdentifyOptions { model: Some(access(&m)), ..Default::default() };
+        let id = identify(&corpus("b.txt", text), &opts, &mut |_| true).unwrap();
+        assert_eq!(names(&id), ["Tobias", "Marta"]);
+        assert!(id.characters.iter().all(|c| c.aliases.is_empty()));
     }
 
     #[test]

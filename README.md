@@ -10,11 +10,13 @@ containers), `flate2`, `encoding_rs` + `chardetng` (legacy text encodings), `ser
 
 ## Run
 
-```
-start.cmd
+Double-click `start.cmd`, or in PowerShell, from this folder:
+
+```powershell
+.\start.cmd
 ```
 
-Then open http://127.0.0.1:7860. `start.cmd` works from any folder. Equivalent, from this folder:
+Then open http://127.0.0.1:7860. Stop a server that is already running first (close its window). Equivalent:
 
 ```
 cargo run --release --bin persona_web

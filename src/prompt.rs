@@ -25,7 +25,7 @@ fn flat(s: &str) -> String {
     t
 }
 
-fn system_block(persona: &Persona, injection: &InjectionContext) -> String {
+pub(crate) fn system_block(persona: &Persona, injection: &InjectionContext) -> String {
     let name = &persona.meta.name;
     let mut s = format!("{}\n", persona.system_prompt.trim());
     if !injection.style_samples.is_empty() {

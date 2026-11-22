@@ -17,7 +17,7 @@ const MEDIA: &[&str] =
 type Zip<'a> = ZipArchive<Cursor<&'a [u8]>>;
 
 const WORD_LIKE: Profile =
-    Profile { text: &["t"], blocks: &["p"], breaks: &["br", "cr"], spaces: &["tab"], skip: &["instrtext", "rph"] };
+    Profile { text: &["t"], blocks: &["p"], breaks: &["br", "cr"], spaces: &["tab"], skip: &["instrtext", "rph", "fallback", "movefrom"] };
 const ODF: Profile = Profile {
     text: &["p", "h"],
     blocks: &["p", "h"],
@@ -81,23 +81,51 @@ pub(super) fn read_zip(name: &str, bytes: &[u8], opts: &ParseOptions, depth: usi
 fn read_archive(name: &str, z: &mut Zip, opts: &ParseOptions, depth: usize, out: &mut Sink) -> Result<(), String> {
     let mut any = false;
     for i in 0..z.len() {
-        let mut file = z.by_index(i).map_err(|e| e.to_string())?;
+        let mut file = match z.by_index(i) {
+            Ok(file) => file,
+            Err(e) => {
+                out.fail(&format!("{name}, entry {}", i + 1), e.to_string()); // password protected, most likely
+                any = true;
+                continue;
+            }
+        };
         let entry_name = file.name().map_err(|e| e.to_string())?.into_owned();
         let extension = entry_name.rsplit('.').next().unwrap_or("").to_lowercase();
-        if file.is_dir() || MEDIA.contains(&extension.as_str()) {
+        if file.is_dir() || MEDIA.contains(&extension.as_str()) || entry_name.split('/').any(super::is_hidden) {
             continue;
         }
-        let mut bytes = Vec::new();
-        file.by_ref().take(MAX_ENTRY_BYTES).read_to_end(&mut bytes).map_err(|e| format!("{entry_name}: {e}"))?;
-        drop(file);
-        read_any(&format!("{name}/{entry_name}"), &bytes, opts, depth + 1, out);
         any = true;
+        let full_name = format!("{name}/{entry_name}");
+        let mut bytes = Vec::new();
+        match file.by_ref().take(MAX_ENTRY_BYTES).read_to_end(&mut bytes) {
+            Ok(_) => read_any(&full_name, &bytes, opts, depth + 1, out),
+            Err(e) => out.fail(&full_name, e.to_string()),
+        }
     }
     if any { Ok(()) } else { Err("no readable files in this archive".into()) }
 }
 
+fn percent_decode(s: &str) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    let mut rest = s.as_bytes();
+    while let Some((&b, tail)) = rest.split_first() {
+        let hex = tail.get(..2).filter(|_| b == b'%').and_then(|h| std::str::from_utf8(h).ok());
+        match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+            Some(decoded) => {
+                out.push(decoded);
+                rest = &tail[2..];
+            }
+            None => {
+                out.push(b);
+                rest = tail;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn resolve(base_file: &str, href: &str) -> String {
-    let href = href.split('#').next().unwrap_or(href).replace("%20", " ");
+    let href = percent_decode(href.split('#').next().unwrap_or(href));
     let mut parts: Vec<&str> = base_file.split('/').collect();
     parts.pop();
     for seg in href.split('/') {
@@ -148,8 +176,11 @@ fn read_epub(z: &mut Zip) -> Result<String, String> {
     Ok(chapters.join("\n\n"))
 }
 
+/// Excel's own limit; a file claiming a cell further out is broken.
+const MAX_COLUMNS: usize = 16_384;
+
 fn column(cell: &str) -> usize {
-    cell.chars().take_while(char::is_ascii_alphabetic).fold(0, |n, c| n * 26 + (c.to_ascii_uppercase() as usize - 64)).saturating_sub(1)
+    cell.chars().take_while(char::is_ascii_alphabetic).take(4).fold(0, |n, c| n * 26 + (c.to_ascii_uppercase() as usize - 64)).saturating_sub(1)
 }
 
 fn read_xlsx(name: &str, z: &mut Zip, opts: &ParseOptions, out: &mut Sink) -> Result<(), String> {
@@ -181,12 +212,12 @@ fn read_xlsx(name: &str, z: &mut Zip, opts: &ParseOptions, out: &mut Sink) -> Re
                         kind = attr(t, "t").unwrap_or_default();
                         value.clear();
                     }
-                    "v" | "t" => inside = true,
+                    "v" | "t" => inside = !is_self_closed(t),
                     _ => {}
                 },
                 Event::Text(t) | Event::Raw(t) if inside => value.push_str(&markup::decode_entities(t)),
                 Event::Close("v" | "t") => inside = false,
-                Event::Close("c") => {
+                Event::Close("c") if col < MAX_COLUMNS => {
                     let cell = match kind.as_str() {
                         "s" => value.trim().parse::<usize>().ok().and_then(|i| shared.get(i).cloned()).unwrap_or_default(),
                         _ => std::mem::take(&mut value),
@@ -315,7 +346,7 @@ fn read_hwp(ole: &mut Ole) -> Result<String, String> {
         let raw = stream(ole, &path)?;
         let data = if props & 1 != 0 {
             let mut inflated = Vec::new();
-            DeflateDecoder::new(&raw[..]).read_to_end(&mut inflated).map_err(|e| e.to_string())?;
+            DeflateDecoder::new(&raw[..]).take(MAX_ENTRY_BYTES).read_to_end(&mut inflated).map_err(|e| e.to_string())?;
             inflated
         } else {
             raw

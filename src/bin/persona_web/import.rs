@@ -17,7 +17,6 @@ const MAX_SESSIONS: usize = 4;
 
 #[derive(Default)]
 pub struct Session {
-    started: i64,
     files: Vec<(String, Vec<u8>)>,
     corpus: Option<Corpus>,
     identification: Option<Identification>,
@@ -31,10 +30,11 @@ pub fn start(app: &App) -> Value {
     let token = format!("{:x}{:x}", now_ms(), app.counter.fetch_add(1, Ordering::Relaxed));
     let mut imports = lock(&app.imports);
     while imports.len() >= MAX_SESSIONS {
-        let oldest = imports.iter().min_by_key(|(_, s)| lock(s).started).map(|(t, _)| t.clone());
+        // tokens start with the time; a session may be locked for minutes, so it must not be asked
+        let oldest = imports.keys().min().cloned();
         imports.remove(&oldest.expect("sessions exist"));
     }
-    imports.insert(token.clone(), Arc::new(Mutex::new(Session { started: now_ms(), ..Default::default() })));
+    imports.insert(token.clone(), Default::default());
     json!({ "token": token })
 }
 

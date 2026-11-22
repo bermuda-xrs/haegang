@@ -162,6 +162,14 @@ pub(super) fn decode_entities(s: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// Entities for U+00A0..=U+00FF, in order.
+const LATIN1: &str = "nbsp iexcl cent pound curren yen brvbar sect uml copy ordf laquo not shy reg macr deg plusmn \
+    sup2 sup3 acute micro para middot cedil sup1 ordm raquo frac14 frac12 frac34 iquest Agrave Aacute Acirc Atilde \
+    Auml Aring AElig Ccedil Egrave Eacute Ecirc Euml Igrave Iacute Icirc Iuml ETH Ntilde Ograve Oacute Ocirc Otilde \
+    Ouml times Oslash Ugrave Uacute Ucirc Uuml Yacute THORN szlig agrave aacute acirc atilde auml aring aelig ccedil \
+    egrave eacute ecirc euml igrave iacute icirc iuml eth ntilde ograve oacute ocirc otilde ouml divide oslash ugrave \
+    uacute ucirc uuml yacute thorn yuml";
+
 fn named_entity(name: &str) -> Option<char> {
     Some(match name {
         "amp" => '&',
@@ -177,9 +185,9 @@ fn named_entity(name: &str) -> Option<char> {
         "rsquo" => '’',
         "ldquo" => '“',
         "rdquo" => '”',
-        "laquo" => '«',
-        "raquo" => '»',
-        _ => return None,
+        "bull" => '•',
+        "euro" => '€',
+        _ => return LATIN1.split(' ').position(|n| n == name).and_then(|i| char::from_u32(0xA0 + i as u32)),
     })
 }
 
@@ -205,7 +213,7 @@ pub(super) const HTML: Profile = Profile {
     ],
     breaks: &["br"],
     spaces: &["td", "th"],
-    skip: &["head", "script", "style", "noscript", "template", "svg", "nav"],
+    skip: &["title", "script", "style", "noscript", "template", "svg", "nav"],
 };
 
 /// Any other XML: every tag separates text.

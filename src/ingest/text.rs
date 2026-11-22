@@ -5,13 +5,19 @@ use chardetng::{EncodingDetector, Iso2022JpDetection, Utf8Detection};
 use encoding_rs::{Encoding, WINDOWS_1252};
 use std::collections::HashMap;
 
-/// BOM, then UTF-8, then a statistical guess for legacy encodings (EUC-KR, Shift_JIS, ...).
+/// BOM, then UTF-8 (a few damaged bytes allowed), then a statistical guess for legacy encodings (EUC-KR, Shift_JIS, ...).
 pub(super) fn decode(bytes: &[u8]) -> String {
     if let Some((enc, bom)) = Encoding::for_bom(bytes) {
         return enc.decode_without_bom_handling(&bytes[bom..]).0.into_owned();
     }
     if let Ok(s) = std::str::from_utf8(bytes) {
         return s.to_string();
+    }
+    let lossy = String::from_utf8_lossy(bytes);
+    let foreign = lossy.chars().filter(|c| !c.is_ascii()).count();
+    let damaged = lossy.chars().filter(|c| *c == '\u{FFFD}').count();
+    if damaged * 5 < foreign {
+        return lossy.into_owned();
     }
     let mut detector = EncodingDetector::new(Iso2022JpDetection::Deny);
     detector.feed(bytes, true);
@@ -73,6 +79,13 @@ pub(crate) fn clean(s: &str) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
+/// Spreadsheets in many locales write "CSV" with semicolons; the first line shows which it is.
+pub(super) fn delimiter(s: &str) -> char {
+    let first = s.lines().next().unwrap_or("");
+    let count = |d: char| first.matches(d).count();
+    [';', '\t'].into_iter().fold(',', |best, d| if count(d) > count(best) { d } else { best })
+}
+
 /// RFC 4180-style rows: quoted fields, doubled quotes, newlines inside quotes.
 pub(super) fn parse_delimited(s: &str, delimiter: char) -> Vec<Vec<String>> {
     let (mut rows, mut row, mut field) = (Vec::new(), Vec::new(), String::new());
@@ -106,21 +119,33 @@ pub(super) fn parse_delimited(s: &str, delimiter: char) -> Vec<Vec<String>> {
 
 /// SRT / WebVTT cue text. A WebVTT voice tag `<v Bob>` becomes a `Bob:` speaker label.
 pub(super) fn subtitles(s: &str) -> String {
-    let normal = s.replace("\r\n", "\n");
-    let mut cues = Vec::new();
-    for block in normal.split("\n\n") {
-        let lines: Vec<String> = block
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.contains("-->") && !l.chars().all(|c| c.is_ascii_digit()))
-            .filter(|l| !l.starts_with("WEBVTT") && !l.starts_with("NOTE"))
-            .map(strip_cue_tags)
-            .collect();
-        if !lines.is_empty() {
-            cues.push(lines.join("\n"));
+    let mut cues: Vec<Vec<String>> = Vec::new();
+    let (mut after_blank, mut last_after_blank, mut in_note) = (true, false, false);
+    for line in s.lines().map(str::trim) {
+        if line.is_empty() {
+            (after_blank, in_note) = (true, false);
+            continue;
         }
+        if line.contains("-->") {
+            // the line above a timing line is the cue's number or id
+            if let Some(cue) = cues.last_mut() {
+                if last_after_blank || cue.last().is_some_and(|l| l.chars().all(|c| c.is_ascii_digit())) {
+                    cue.pop();
+                }
+            }
+            cues.push(Vec::new());
+            (after_blank, last_after_blank) = (false, false);
+            continue;
+        }
+        in_note |= after_blank && (line == "NOTE" || line.starts_with("NOTE "));
+        // nothing before the first cue is dialogue
+        if let Some(cue) = cues.last_mut().filter(|_| !in_note) {
+            cue.push(strip_cue_tags(line));
+            last_after_blank = after_blank;
+        }
+        after_blank = false;
     }
-    cues.join("\n\n")
+    cues.iter().filter(|c| !c.is_empty()).map(|c| c.join("\n")).collect::<Vec<_>>().join("\n\n")
 }
 
 fn strip_cue_tags(line: &str) -> String {
@@ -128,15 +153,20 @@ fn strip_cue_tags(line: &str) -> String {
     let mut rest = line;
     while let Some(i) = rest.find('<') {
         out.push_str(&rest[..i]);
-        let Some(end) = rest[i..].find('>') else { break };
-        let tag = &rest[i + 1..i + end];
-        if let Some(name) = tag.strip_prefix("v ") {
+        rest = &rest[i..];
+        let is_tag = rest[1..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '/');
+        let Some(end) = rest.find('>').filter(|_| is_tag) else {
+            out.push('<');
+            rest = &rest[1..];
+            continue;
+        };
+        if let Some(name) = rest[1..end].strip_prefix("v ") {
             out.push_str(name.trim());
             out.push_str(": ");
         }
-        rest = &rest[i + end + 1..];
+        rest = &rest[end + 1..];
     }
-    out.push_str(rest.rsplit('>').next().unwrap_or(rest));
+    out.push_str(rest);
     out
 }
 
@@ -153,6 +183,7 @@ pub(super) fn rtf(bytes: &[u8]) -> String {
     let mut pending: Vec<u8> = Vec::new(); // `\'hh` bytes: one code point can span several escapes
     let mut encoding = WINDOWS_1252;
     let mut skip_chars = 0usize; // ASCII fallback following a `\uN`
+    let mut high = 0u32; // first half of a surrogate pair
     let mut i = 0;
 
     fn flush(pending: &mut Vec<u8>, out: &mut String, encoding: &'static Encoding) {
@@ -198,6 +229,7 @@ pub(super) fn rtf(bytes: &[u8]) -> String {
                     match next {
                         b'*' => stack.last_mut().unwrap().skip = true,
                         b'\\' | b'{' | b'}' if !top.skip => out.push(next as char),
+                        b'_' if !top.skip => out.push('-'),
                         b'~' if !top.skip => out.push(' '),
                         b'\n' | b'\r' if !top.skip => out.push('\n'),
                         _ => {}
@@ -224,8 +256,15 @@ pub(super) fn rtf(bytes: &[u8]) -> String {
                     "u" => {
                         let v = param.unwrap_or(0);
                         let code = if v < 0 { v + 65536 } else { v } as u32;
-                        if !top.skip {
-                            out.push(char::from_u32(code).unwrap_or('\u{FFFD}'));
+                        match code {
+                            0xD800..=0xDBFF => high = code,
+                            _ if top.skip => {}
+                            0xDC00..=0xDFFF if high != 0 => {
+                                let pair = 0x10000 + ((high - 0xD800) << 10) + (code - 0xDC00);
+                                out.push(char::from_u32(pair).unwrap_or('\u{FFFD}'));
+                                high = 0;
+                            }
+                            _ => out.push(char::from_u32(code).unwrap_or('\u{FFFD}')),
                         }
                         skip_chars = top.unicode_skip;
                     }
@@ -274,26 +313,52 @@ fn codepage(cp: i32) -> &'static Encoding {
     Encoding::for_label(label.as_bytes()).unwrap_or(WINDOWS_1252)
 }
 
-/// Drop page numbers and running heads from PDF text: a short line that keeps coming back,
-/// ignoring the digits in it, is furniture rather than content.
-pub(super) fn strip_page_furniture(text: &str) -> String {
+/// Page text as one, without page numbers and running heads: lines at the edges of pages that keep coming back.
+pub(super) fn join_pages(pages: &[String]) -> String {
+    const EDGE: usize = 2;
     const SHORT: usize = 60;
     const REPEATS: usize = 4;
-    let key = |l: &str| l.trim().chars().filter(|c| !c.is_ascii_digit()).collect::<String>();
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for line in text.lines().filter(|l| l.trim().chars().count() <= SHORT) {
-        *counts.entry(key(line)).or_default() += 1;
-    }
-    let mut out = String::with_capacity(text.len());
-    for line in text.lines() {
-        let t = line.trim();
-        let page_number = !t.is_empty() && t.chars().all(|c| c.is_ascii_digit());
-        let repeated =
-            !t.is_empty() && t.chars().count() <= SHORT && counts.get(&key(line)).is_some_and(|n| *n >= REPEATS);
-        if !page_number && !repeated {
-            out.push_str(line);
-            out.push('\n');
+    let unnumbered = |l: &str| l.chars().filter(|c| !c.is_ascii_digit()).collect::<String>();
+    let pages: Vec<Vec<&str>> =
+        pages.iter().map(|p| p.trim().lines().map(str::trim_end).collect::<Vec<_>>()).collect();
+
+    let edges_of = |page: &[&str]| -> Vec<usize> {
+        let filled: Vec<usize> = (0..page.len()).filter(|&i| !page[i].trim().is_empty()).collect();
+        let tail = filled.len().saturating_sub(EDGE).max(EDGE.min(filled.len()));
+        filled[..EDGE.min(filled.len())].iter().chain(&filled[tail..]).copied().collect()
+    };
+    let mut exact: HashMap<&str, usize> = HashMap::new();
+    let mut numbered: HashMap<String, usize> = HashMap::new();
+    for page in &pages {
+        for i in edges_of(page) {
+            *exact.entry(page[i].trim()).or_default() += 1;
+            *numbered.entry(unnumbered(page[i].trim())).or_default() += 1;
         }
+    }
+    // "Title 12" is on most pages; "Chapter 12" on few, and must stay
+    let is_furniture = |l: &str| {
+        let numbers = numbered.get(&unnumbered(l)).copied().unwrap_or(0);
+        l.chars().all(|c| c.is_ascii_digit())
+            || (l.chars().count() <= SHORT
+                && (exact.get(l).is_some_and(|n| *n >= REPEATS) || (numbers >= REPEATS && numbers * 4 >= pages.len())))
+    };
+
+    let mut out = String::new();
+    for page in &pages {
+        let edges = edges_of(page);
+        let body: Vec<&str> =
+            page.iter().enumerate().filter(|(i, l)| !(edges.contains(i) && is_furniture(l.trim()))).map(|x| *x.1).collect();
+        let body = body.join("\n");
+        let body = body.trim_matches('\n');
+        if body.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            // a sentence can run over the page break
+            let ended = out.ends_with(['.', '!', '?', '…', '。', '"', '”', '’', '」', '』']);
+            out.push_str(if ended { "\n\n" } else { "\n" });
+        }
+        out.push_str(body);
     }
     out
 }
@@ -350,13 +415,32 @@ mod tests {
 
     #[test]
     fn page_furniture() {
-        let mut pdf = String::new();
-        for page in 1..=5 {
-            pdf.push_str(&format!("THE KEEPER {page}\nBody text of page {page} is different: {}\n{page}\n", "x".repeat(page * 15)));
-        }
-        let clean = strip_page_furniture(&pdf);
-        assert!(clean.contains("Body text of page 3"));
+        let pages: Vec<String> = (1..=5)
+            .map(|p| format!("THE KEEPER {p}\n\nOn page {p}{}.\n“No.”\n1984\nThe end of page {p}{}.\n\n{p}\n", "x".repeat(p * 9), "y".repeat(p * 9)))
+            .collect();
+        let clean = join_pages(&pages);
+        assert!(clean.contains("On page 3"));
         assert!(!clean.contains("THE KEEPER"));
         assert!(!clean.lines().any(|l| l == "3"));
+        // lines inside a page are content however often they come back
+        assert_eq!(clean.matches("“No.”").count(), 5);
+        assert_eq!(clean.matches("1984").count(), 5);
+
+        let chapters: Vec<String> = (1..=40)
+            .map(|p| if p % 10 == 0 { format!("Chapter {}\nText {p}.", p / 10) } else { format!("Body {}\nmore {}", "a".repeat(p), "b".repeat(p)) })
+            .collect();
+        assert_eq!(join_pages(&chapters).matches("Chapter").count(), 4);
+    }
+
+    #[test]
+    fn damage_does_not_change_the_encoding() {
+        let mut bytes = "폭풍이 지나간 다음 날, 민수는 항구에서 지수를 기다리고 있었다.".as_bytes().to_vec();
+        bytes[1] = b'x';
+        assert!(decode(&bytes).contains("민수는 항구에서"));
+    }
+
+    #[test]
+    fn rtf_emoji() {
+        assert_eq!(rtf(br"{\rtf1 \u-10179?\u-8704?}").trim(), "😀");
     }
 }

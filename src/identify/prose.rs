@@ -118,13 +118,15 @@ fn is_scare_quote(text: &str) -> bool {
     text.split_whitespace().count() <= 3 && !text.trim_end().ends_with(['.', ',', '!', '?', '…', '。', '！', '？'])
 }
 
-fn split_quotes(par: &str, style: Style) -> Vec<Piece> {
+/// The pieces of a paragraph, and whether it ends inside a quote.
+fn split_quotes(par: &str, style: Style) -> (Vec<Piece>, bool) {
     if style.dashes && par.starts_with(DASHES) {
         let body = par.trim_start_matches(DASHES).trim_start();
-        return match body.split_once(DASHES) {
+        let pieces = match body.split_once(DASHES) {
             Some((said, tag)) => piece(true, said).into_iter().chain(piece(false, tag)).collect(),
             None => piece(true, body).into_iter().collect(),
         };
+        return (pieces, false);
     }
     let chars: Vec<(usize, char)> = par.char_indices().collect();
     let mut pieces: Vec<Piece> = Vec::new();
@@ -164,18 +166,29 @@ fn split_quotes(par: &str, style: Style) -> Vec<Piece> {
             merged.push(p);
         }
     }
-    merged
+    (merged, open.is_some())
 }
 
 pub(super) fn parse(paragraphs: &[String]) -> Vec<Para> {
     let style = detect_style(paragraphs);
-    paragraphs
-        .iter()
-        .map(|p| match is_heading(p) {
-            true => Para { pieces: Vec::new(), heading: true },
-            false => Para { pieces: split_quotes(p, style), heading: false },
-        })
-        .collect()
+    let mut paras: Vec<Para> = Vec::with_capacity(paragraphs.len());
+    let mut open = false;
+    for p in paragraphs {
+        if is_heading(p) {
+            paras.push(Para { pieces: Vec::new(), heading: true });
+            open = false;
+            continue;
+        }
+        let (mut pieces, unclosed) = split_quotes(p, style);
+        // a long speech opens every paragraph with a quote mark but closes only the last
+        let continues = open && pieces.first().is_some_and(|f| f.quote);
+        match paras.last_mut() {
+            Some(last) if continues => last.pieces.append(&mut pieces),
+            _ => paras.push(Para { pieces, heading: false }),
+        }
+        open = unclosed;
+    }
+    paras
 }
 
 pub(super) fn quote_count(paras: &[Para]) -> usize {
@@ -324,7 +337,7 @@ mod tests {
 
     fn quotes_of(par: &str) -> Vec<String> {
         let style = Style { singles: false, dashes: false };
-        split_quotes(par, style).into_iter().filter(|p| p.quote).map(|p| p.text).collect()
+        split_quotes(par, style).0.into_iter().filter(|p| p.quote).map(|p| p.text).collect()
     }
 
     #[test]

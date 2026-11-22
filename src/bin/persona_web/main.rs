@@ -7,7 +7,7 @@ mod httpd;
 mod import;
 
 use httpd::{percent_decode, read_request, send, send_error, send_json, Request};
-use persona_core::{Error, Persona, PersonaStore, Result, Settings};
+use persona_core::{DenseIndex, Error, Persona, PersonaStore, Result, Settings};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::net::{TcpListener, TcpStream};
@@ -27,6 +27,8 @@ pub struct App {
     cache: Mutex<HashMap<PathBuf, Arc<Persona>>>,
     imports: Mutex<HashMap<String, Arc<Mutex<import::Session>>>>,
     building: Mutex<HashSet<String>>,
+    /// Why the last index build of a persona failed.
+    index_errors: Mutex<HashMap<String, String>>,
     pub chat_lock: Mutex<()>,
     pub counter: AtomicU64,
 }
@@ -41,6 +43,7 @@ fn main() {
         cache: Default::default(),
         imports: Default::default(),
         building: Default::default(),
+        index_errors: Default::default(),
         chat_lock: Default::default(),
         counter: AtomicU64::new(0),
     });
@@ -97,7 +100,9 @@ impl App {
     /// Cached persona; semantic retrieval is attached only if its index already exists.
     pub fn persona(&self, name: &str) -> Result<Arc<Persona>> {
         let key = self.store.path(name)?;
-        if let Some(p) = lock(&self.cache).get(&key) {
+        // held while loading, or a prompt saved meanwhile would be overwritten by the stale copy
+        let mut cache = lock(&self.cache);
+        if let Some(p) = cache.get(&key) {
             return Ok(p.clone());
         }
         let mut p = self.store.load_persona(name)?;
@@ -108,7 +113,7 @@ impl App {
             }
         }
         let p = Arc::new(p);
-        lock(&self.cache).insert(key, p.clone());
+        cache.insert(key, p.clone());
         Ok(p)
     }
 
@@ -122,6 +127,7 @@ impl App {
         if !lock(&self.building).insert(name.clone()) {
             return;
         }
+        lock(&self.index_errors).remove(&name);
         let app = self.clone();
         std::thread::spawn(move || {
             let r = (|| -> Result<()> {
@@ -132,6 +138,7 @@ impl App {
             })();
             if let Err(e) = r {
                 eprintln!("semantic index for {name} failed: {e}");
+                lock(&app.index_errors).insert(name.clone(), e.to_string());
             }
             app.forget(&name);
             lock(&app.building).remove(&name);
@@ -181,8 +188,9 @@ fn api(app: &Arc<App>, req: &mut Request, segs: &[&str]) -> Result<Value> {
     match (req.method.as_str(), segs) {
         ("GET", ["api", "personas"]) => list_personas(app),
         ("DELETE", ["api", "personas", name]) => {
-            app.forget(name);
+            let key = app.store.path(name)?;
             app.store.delete_persona(name)?;
+            lock(&app.cache).remove(&key);
             ok()
         }
         ("GET", ["api", "personas", name, "chat"]) => Ok(json!(chatlog::load(app, name)?)),
@@ -204,6 +212,9 @@ fn api(app: &Arc<App>, req: &mut Request, segs: &[&str]) -> Result<Value> {
         }
         ("POST", ["api", "personas", name, "embeddings"]) => {
             app.store.path(name)?;
+            if app.store.settings()?.embedder().is_none() {
+                return Err(Error::Invalid("set an embedding model in Settings first (it needs the Ollama backend)".into()));
+            }
             app.start_embeddings(name.to_string());
             ok()
         }
@@ -254,12 +265,13 @@ fn api(app: &Arc<App>, req: &mut Request, segs: &[&str]) -> Result<Value> {
 
 fn list_personas(app: &App) -> Result<Value> {
     let building = lock(&app.building).clone();
+    let embed_model = app.store.settings().ok().and_then(|s| s.embed_model);
     let mut out = Vec::new();
     for m in app.store.list_personas()? {
-        let dir = app.store.path(&m.name)?;
+        let Ok(dir) = app.store.path(&m.name) else { continue };
         let embeddings = if building.contains(&m.name) {
             "building"
-        } else if dir.join("embeddings.bin").exists() {
+        } else if embed_model.is_some() && DenseIndex::model_of(&dir.join("embeddings.bin")) == embed_model {
             "ready"
         } else {
             "none"
@@ -269,7 +281,7 @@ fn list_personas(app: &App) -> Result<Value> {
             "name": m.name, "target": m.target_sender, "general": m.general, "source": m.source,
             "messages": m.message_count, "persona_messages": m.persona_message_count,
             "model": m.model, "embeddings": embeddings, "avatar": avatar::version(&dir, "avatar"),
-            "last": last,
+            "index_error": lock(&app.index_errors).get(&m.name), "last": last,
         }));
     }
     Ok(json!(out))

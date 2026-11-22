@@ -34,7 +34,9 @@ const KO_VERBS: &[&str] = &[
     "말했", "말하", "말씀", "물었", "물으", "묻", "대답", "답했", "외쳤", "외치", "소리쳤", "소리질", "속삭", "중얼",
     "덧붙", "되물", "소리쳐", "말을",
 ];
-const KO_PARTICLES: &[&str] = &["께서는", "께서", "에게", "이가", "은", "는", "이", "가", "도"];
+const KO_PARTICLES: &[&str] = &["께서는", "께서", "이가", "은", "는", "이", "가", "도"];
+/// Who is spoken to, even when a topic particle follows: 지수에게는.
+const KO_LISTENER: &[&str] = &["에게", "한테", "께", "더러", "보고"];
 const KO_FIRST: &[&str] = &["나", "내", "저", "제"];
 const KO_PRONOUNS: &[&str] = &[
     "그", "그녀", "그들", "너", "네", "당신", "자기", "누군가", "사람", "남자", "여자", "아이", "소년", "소녀",
@@ -150,7 +152,7 @@ fn english(tokens: &[&str]) -> Option<Tag> {
 fn korean(tokens: &[&str]) -> Option<Tag> {
     let verb = tokens.iter().position(|t| KO_VERBS.iter().any(|v| word(t).starts_with(v)))?;
     // the nearest word before the verb carrying a subject particle: 지수가 조용히 물었다
-    for t in tokens[..verb].iter().rev().take(2) {
+    for t in tokens[..verb].iter().rev().take(3) {
         let w = word(t);
         let Some(stem) = KO_PARTICLES.iter().find_map(|p| w.strip_suffix(p)) else { continue };
         if KO_FIRST.contains(&stem) {
@@ -159,7 +161,8 @@ fn korean(tokens: &[&str]) -> Option<Tag> {
         if KO_PRONOUNS.contains(&stem) {
             return Some(Tag::Pronoun);
         }
-        if !stem.is_empty() {
+        // one syllable is an adverb: 같이, 깊이, 많이
+        if stem.chars().count() >= 2 && !KO_LISTENER.iter().any(|p| stem.ends_with(p)) {
             return Some(Tag::Name(stem.to_string()));
         }
     }

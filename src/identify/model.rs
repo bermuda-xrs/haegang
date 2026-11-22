@@ -50,8 +50,9 @@ fn ask(access: &ModelAccess, system: &str, user: String, schema: Value) -> Resul
 
 /// The characters in one excerpt.
 pub(super) fn propose(access: &ModelAccess, title: &str, excerpt: &str) -> Result<Vec<Member>> {
+    let source = if title.is_empty() { String::new() } else { format!(" from \"{title}\"") };
     let user = format!(
-        "Below is an excerpt from \"{title}\". List the characters in it: everyone who speaks or acts.\n\
+        "Below is an excerpt{source}. List the characters in it: everyone who speaks or acts.\n\
          Write names exactly as they appear in the text. If one character goes by several names, give one \
          entry with the other names as aliases. Leave out places, organisations and the author. \
          \"role\" says who they are in a few words, in the language of the text.\n\
@@ -169,7 +170,12 @@ fn members_in(list: &[Value]) -> Vec<Member> {
         .filter_map(|c| {
             let name = if c.is_string() { text(c) } else { text(&c["name"]) };
             let usable = !name.is_empty() && name.chars().count() <= 60;
-            usable.then(|| Member { name, aliases: strings(&c["aliases"]), description: text(&c["role"]) })
+            usable.then(|| Member {
+                name,
+                aliases: strings(&c["aliases"]),
+                description: text(&c["role"]),
+                distinct: false,
+            })
         })
         .collect()
 }

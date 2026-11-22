@@ -8,7 +8,7 @@ use crate::{ChatMessage, Message, Persona};
 use std::collections::HashMap;
 
 /// A longer gap starts a new turn and breaks the link between one turn and the next.
-const TURN_GAP_MS: i64 = 60 * 60 * 1000;
+const TURN_GAP_MS: u64 = 60 * 60 * 1000;
 /// A turn stops growing here: pages of narration are many passages, not one reply.
 const MAX_TURN_BYTES: usize = 1500;
 
@@ -112,7 +112,7 @@ pub(crate) fn build_exchanges(messages: &[Message], target: &str) -> Vec<Exchang
     let mut turns: Vec<Turn> = Vec::new();
     for m in messages {
         let grows = turns.last().is_some_and(|t| {
-            t.sender == m.sender && m.timestamp_ms - t.end_ms <= TURN_GAP_MS && t.text.len() < MAX_TURN_BYTES
+            t.sender == m.sender && m.timestamp_ms.abs_diff(t.end_ms) <= TURN_GAP_MS && t.text.len() < MAX_TURN_BYTES
         });
         match turns.last_mut() {
             Some(t) if grows => {
@@ -136,7 +136,7 @@ pub(crate) fn build_exchanges(messages: &[Message], target: &str) -> Vec<Exchang
         .map(|(i, t)| {
             let answered = i.checked_sub(1).map(|j| &turns[j]);
             let context = match answered {
-                Some(p) if !p.persona && t.start_ms - p.end_ms <= TURN_GAP_MS => p.text.clone(),
+                Some(p) if !p.persona && t.start_ms.abs_diff(p.end_ms) <= TURN_GAP_MS => p.text.clone(),
                 _ => String::new(),
             };
             Exchange { context, reply: t.text.clone(), timestamp_ms: t.start_ms }
@@ -271,9 +271,9 @@ impl Bm25Retriever {
 
     /// Favour recent exchanges, then keep the best `k`.
     pub(crate) fn boost_recent(&self, hits: &mut Vec<(usize, f32)>, k: usize) {
-        let span = (self.ts_range.1 - self.ts_range.0).max(1) as f32;
+        let span = self.ts_range.1.abs_diff(self.ts_range.0).max(1) as f32;
         for (i, score) in hits.iter_mut() {
-            let age = (self.exchanges[*i].timestamp_ms - self.ts_range.0) as f32 / span;
+            let age = self.exchanges[*i].timestamp_ms.abs_diff(self.ts_range.0) as f32 / span;
             *score *= 1.0 + Self::RECENCY_BOOST * age;
         }
         top_k(hits, k);

@@ -8,6 +8,8 @@ pub(super) struct Member {
     pub name: String,
     pub aliases: Vec<String>,
     pub description: String,
+    /// The source, or the user, already tells this person apart from the other distinct ones.
+    pub distinct: bool,
 }
 
 impl Member {
@@ -64,15 +66,17 @@ pub(super) fn merge(mut list: Vec<Member>) -> Vec<Member> {
     list.sort_by_key(|m| Reverse(m.name.chars().count()));
     let mut out: Vec<Member> = Vec::new();
     for m in list {
-        let exact = out.iter().position(|o| o.surfaces().any(|a| m.surfaces().any(|b| a.eq_ignore_ascii_case(b))));
+        let may_join = |o: &Member| !(o.distinct && m.distinct) || o.name.eq_ignore_ascii_case(&m.name);
+        let exact = out.iter().position(|o| may_join(o) && o.surfaces().any(|a| m.surfaces().any(|b| a.eq_ignore_ascii_case(b))));
         let partial: Vec<usize> = (0..out.len())
-            .filter(|&i| out[i].surfaces().any(|a| m.surfaces().any(|b| names_match(a, b))))
+            .filter(|&i| may_join(&out[i]) && out[i].surfaces().any(|a| m.surfaces().any(|b| names_match(a, b))))
             .collect();
         let target = exact.or(if partial.len() == 1 { Some(partial[0]) } else { None });
         let Some(i) = target else {
             out.push(m);
             continue;
         };
+        out[i].distinct |= m.distinct;
         for s in std::iter::once(m.name).chain(m.aliases) {
             if !out[i].surfaces().any(|a| a.eq_ignore_ascii_case(&s)) {
                 out[i].aliases.push(s);
@@ -82,7 +86,10 @@ pub(super) fn merge(mut list: Vec<Member>) -> Vec<Member> {
             out[i].description = m.description;
         }
     }
+    // a name belongs to the person called that, not to those also known by it
+    let taken: Vec<String> = out.iter().map(|m| m.name.to_lowercase()).collect();
     for m in &mut out {
+        m.aliases.retain(|a| !taken.contains(&a.to_lowercase()));
         let mut seen = vec![m.name.to_lowercase()];
         m.aliases.retain(|a| {
             let key = a.to_lowercase();
@@ -208,8 +215,8 @@ mod tests {
 
     #[test]
     fn aliases_join_and_descriptions_survive() {
-        let a = Member { name: "Elizabeth Bennet".into(), aliases: vec!["Lizzy".into()], description: String::new() };
-        let b = Member { name: "Lizzy".into(), aliases: vec!["Eliza".into()], description: "the heroine".into() };
+        let a = Member { name: "Elizabeth Bennet".into(), aliases: vec!["Lizzy".into()], ..Default::default() };
+        let b = Member { name: "Lizzy".into(), aliases: vec!["Eliza".into()], description: "the heroine".into(), ..Default::default() };
         let m = merge(vec![a, b]);
         assert_eq!(m.len(), 1);
         assert!(m[0].aliases.contains(&"Eliza".to_string()));
@@ -218,7 +225,7 @@ mod tests {
 
     #[test]
     fn aliases_stay_unique() {
-        let a = Member { name: "Tomas".into(), aliases: vec!["Tobias".into(), "Tomas".into(), "tobias".into()], description: String::new() };
+        let a = Member { name: "Tomas".into(), aliases: vec!["Tobias".into(), "Tomas".into(), "tobias".into()], ..Default::default() };
         assert_eq!(merge(vec![a])[0].aliases, ["Tobias"]);
     }
 

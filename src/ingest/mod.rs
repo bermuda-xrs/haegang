@@ -99,19 +99,23 @@ fn collect(p: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
         .collect();
     entries.sort();
     for e in entries {
-        collect(&e, out)?;
+        if !e.file_name().is_some_and(|n| is_hidden(&n.to_string_lossy())) {
+            collect(&e, out)?;
+        }
     }
     Ok(())
+}
+
+/// System clutter: `.DS_Store`, `.git`, macOS resource forks.
+fn is_hidden(name: &str) -> bool {
+    name.starts_with('.') || name == "__MACOSX"
 }
 
 /// Read named in-memory files. Fails only when nothing at all could be read.
 pub fn ingest_files(files: &[(String, Vec<u8>)], opts: &ParseOptions) -> Result<Corpus> {
     let sinks = in_parallel(files, |(name, bytes)| {
         let mut sink = Sink::default();
-        // a parser panic on malformed input must cost one file, not the whole import
-        if catch_unwind(AssertUnwindSafe(|| read_any(name, bytes, opts, 0, &mut sink))).is_err() {
-            sink.fail(name, "this file is damaged or uses an unsupported variant of its format".into());
-        }
+        read_any(name, bytes, opts, 0, &mut sink);
         sink
     });
 
@@ -157,8 +161,14 @@ fn in_parallel<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> 
     results.into_inner().unwrap_or_else(|e| e.into_inner()).into_iter().flatten().collect()
 }
 
-/// Decide the format and read one file.
+/// Read one file. A parser panic on malformed input costs that file alone, not its archive or the import.
 fn read_any(name: &str, bytes: &[u8], opts: &ParseOptions, depth: usize, out: &mut Sink) {
+    if catch_unwind(AssertUnwindSafe(|| read_detected(name, bytes, opts, depth, out))).is_err() {
+        out.fail(name, "this file is damaged or uses an unsupported variant of its format".into());
+    }
+}
+
+fn read_detected(name: &str, bytes: &[u8], opts: &ParseOptions, depth: usize, out: &mut Sink) {
     let head = &bytes[..bytes.len().min(1024)];
     let result = if bytes.is_empty() {
         Err("the file is empty".to_string())
@@ -184,8 +194,9 @@ fn read_any(name: &str, bytes: &[u8], opts: &ParseOptions, depth: usize, out: &m
 }
 
 fn read_pdf(name: &str, bytes: &[u8], out: &mut Sink) -> std::result::Result<(), String> {
-    let raw = pdf_extract::extract_text_from_mem(bytes).map_err(|e| format!("could not read this PDF: {e}"))?;
-    let clean = text::strip_page_furniture(&raw);
+    let pages =
+        pdf_extract::extract_text_from_mem_by_pages(bytes).map_err(|e| format!("could not read this PDF: {e}"))?;
+    let clean = text::join_pages(&pages);
     if clean.chars().filter(|c| c.is_alphanumeric()).count() < 16 {
         return Err("this PDF has no text layer (it is probably scanned pages)".into());
     }
@@ -199,7 +210,7 @@ fn read_textual(name: &str, bytes: &[u8], opts: &ParseOptions, out: &mut Sink) -
         return Err("unsupported binary format".into());
     }
     let extension = name.rsplit('.').next().unwrap_or("").to_lowercase();
-    let start = decoded.trim_start().get(..64).unwrap_or(decoded.trim_start()).to_lowercase();
+    let start = decoded.trim_start().chars().take(64).collect::<String>().to_lowercase();
 
     let json = match extension.as_str() {
         "json" | "jsonl" | "ndjson" => Some(dataset::parse_json(decoded.as_bytes(), opts).map_err(|e| e.to_string())?),
@@ -213,7 +224,7 @@ fn read_textual(name: &str, bytes: &[u8], opts: &ParseOptions, out: &mut Sink) -
     }
 
     match extension.as_str() {
-        "csv" => read_table(name, "CSV", text::parse_delimited(&decoded, ','), opts, out),
+        "csv" => read_table(name, "CSV", text::parse_delimited(&decoded, text::delimiter(&decoded)), opts, out),
         "tsv" => read_table(name, "TSV", text::parse_delimited(&decoded, '\t'), opts, out),
         "srt" | "vtt" => out.text(name, "Subtitles", text::subtitles(&decoded)),
         "html" | "htm" | "xhtml" => out.text(name, "HTML", markup::extract(&decoded, &markup::HTML)),
