@@ -1,0 +1,20 @@
+[package]
+name = "persona_core"
+version = "0.1.0"
+edition = "2021"
+description = "Core library for a local multi-persona chat app: read any document, identify its characters, chat with them."
+
+[dependencies]
+cfb = "0.16"
+chardetng = "1"
+encoding_rs = "0.8"
+flate2 = "1"
+pdf-extract = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+
+# Unwinding stays on: a parser panic on a malformed file is caught per file (see ingest).
+[profile.release]
+lto = "thin"
+codegen-units = 4

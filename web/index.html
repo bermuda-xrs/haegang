@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Haegang</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=UnifrakturCook:wght@700&display=swap">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app">
+  <nav id="rail">
+    <div class="logo" title="Haegang">H</div>
+    <button class="rail-btn active" title="Messages" id="btn-messages"></button>
+    <button class="rail-btn" title="Import" id="btn-import-rail"></button>
+    <div class="grow"></div>
+    <button class="rail-btn" title="Settings" id="btn-settings"></button>
+    <button class="rail-btn me" title="Your profile photo" id="btn-me"></button>
+  </nav>
+
+  <aside id="inbox">
+    <header>
+      <h1>Messages</h1>
+      <button class="icon-btn" id="btn-new" title="Import"></button>
+    </header>
+    <div class="search"><input id="search" type="search" placeholder="Search" autocomplete="off"></div>
+    <div id="strip" class="strip" hidden></div>
+    <div class="inbox-label">Messages</div>
+    <div id="list"></div>
+  </aside>
+
+  <main id="thread"></main>
+  <aside id="info" hidden></aside>
+</div>
+
+<dialog id="dlg-import">
+  <form method="dialog" class="dlg-head"><h2>Import</h2><button class="icon-btn" value="x" aria-label="Close">✕</button></form>
+  <div class="dlg-body" id="import-body"></div>
+</dialog>
+
+<dialog id="dlg-settings">
+  <form method="dialog" class="dlg-head"><h2>Settings</h2><button class="icon-btn" value="x" aria-label="Close">✕</button></form>
+  <div class="dlg-body" id="settings-body"></div>
+</dialog>
+
+<script src="/app.js"></script>
+</body>
+</html>

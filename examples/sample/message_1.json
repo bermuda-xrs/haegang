@@ -1,0 +1,11 @@
+{
+  "participants": [{"name": "Alex"}, {"name": "Sam"}],
+  "messages": [
+    {"sender_name": "Alex", "timestamp_ms": 1700000500000, "content": "haha yes!! trail mix is mandatory ð\u009f\u0098\u0080"},
+    {"sender_name": "Sam", "timestamp_ms": 1700000400000, "content": "should I bring snacks for the hike?"},
+    {"sender_name": "Alex", "timestamp_ms": 1700000300000, "photos": [{"uri": "photos/1.jpg"}]},
+    {"sender_name": "Sam", "timestamp_ms": 1700000250000, "content": "Alex sent an attachment."},
+    {"sender_name": "Alex", "timestamp_ms": 1700000200000, "content": "saturday works, the trail opens at 7am"},
+    {"sender_name": "Sam", "timestamp_ms": 1700000100000, "content": "are we still hiking this weekend?"}
+  ]
+}

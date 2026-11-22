@@ -1,0 +1,11 @@
+{
+  "participants": [{"name": "Sam"}, {"name": "Alex"}],
+  "messages": [
+    {"sender_name": "Alex", "timestamp_ms": 1690000300000, "content": "pepperoni obviously, no pineapple. never https://example.com/x"},
+    {"sender_name": "Sam", "timestamp_ms": 1690000200000, "content": "pizza tonight? what toppings do you want"},
+    {"sender_name": "Alex", "timestamp_ms": 1690000100000, "content": "morning!  coffee first   ð\u009f\u0098\u0080"},
+    {"sender_name": "Sam", "timestamp_ms": 1690000050000, "content": "Liked a message"},
+    {"sender_name": "Sam", "timestamp_ms": 1690000000000, "content": "good morning"},
+    {"sender_name": "Sam", "timestamp_ms": 1690000000000, "content": "good morning"}
+  ]
+}
